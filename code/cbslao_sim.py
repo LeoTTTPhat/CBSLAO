@@ -316,12 +316,233 @@ def oracle_nonadaptive(tools: List[Tool], task: Task) -> float:
     return saturate_utility(dp[W])
 
 
+# ---------- Stronger, constraint-aware baselines (added per reviewer critique) ----
+#
+# These four baselines target the concern that the original competitor set
+# (ReAct-capped, BwK-vanilla) was constraint-unaware. We add:
+#   B1. Lagrangian primal-dual (safe-CMDP style; cf. Mahdavi et al. 2012,
+#       Agrawal-Devanur 2014 for the constrained bandit primal-dual view).
+#   B2. CVaR-aware BwK (replaces sub-Gaussian tail with empirical-CVaR tail on
+#       the cost samples; appropriate when costs are heavy-tailed).
+#   B3. Deterministic pre-check UCB (a careful practitioner's guarded greedy:
+#       refuse the call if the upper confidence bound on realised cost would
+#       push the cumulative sum past B).
+#   B4. Non-adaptive chance-constrained knapsack (offline 0/1 knapsack on
+#       "inflated" costs c_i + z * sigma_i; this is the proper non-adaptive
+#       optimum against which CBUC's regret bound is stated).
+
+
+def run_policy_lagrangian(tools: List[Tool], task: Task,
+                          rng: np.random.Generator,
+                          eta: float = 0.1, prior_N: int = 3) -> RunResult:
+    """B1. Primal-dual Lagrangian bandit.
+
+    Maintains non-negative dual variables lam_b (budget) and lam_d (deadline).
+    Each round selects i = argmax hat_u_i - lam_b * hat_c_i - lam_d * hat_l_i,
+    subject to simple remaining-budget feasibility.  Duals are updated by
+    projected sub-gradient ascent on the *normalised* resource consumption,
+    mirroring the standard safe-CMDP / Lagrangian BwK formulation."""
+    K = len(tools)
+    hat_u = np.zeros(K); hat_c = np.array([t.mean_cost for t in tools])
+    hat_l = np.array([t.mean_latency for t in tools]); N = np.full(K, prior_N)
+    sum_cost = 0.0; sum_lat = 0.0; sum_u = 0.0; n = 0; t_step = 1
+    lam_b = 0.0; lam_d = 0.0
+    # Expected horizon for per-round budget share.
+    T_guess = max(1, int(task.budget / max(np.mean(hat_c), 1e-6)))
+    per_step_b = task.budget / T_guess
+    per_step_d = task.deadline / T_guess
+    while True:
+        best_i = -1; best_score = -np.inf
+        for i in range(K):
+            if sum_cost + hat_c[i] > task.budget or sum_lat + hat_l[i] > task.deadline:
+                continue
+            # Add a modest UCB bonus to encourage exploration.
+            bonus = math.sqrt(2.0 * math.log(t_step + 1) / max(N[i], 1))
+            score = (hat_u[i] + bonus) - lam_b * hat_c[i] - lam_d * hat_l[i]
+            if score > best_score:
+                best_score = score; best_i = i
+        if best_i < 0 or best_score <= 0:
+            break
+        t = tools[best_i]
+        c = t.sample_cost(rng); l = t.sample_latency(rng); u = t.sample_observation_utility(rng)
+        N[best_i] += 1
+        hat_u[best_i] += (u - hat_u[best_i]) / N[best_i]
+        hat_c[best_i] += (c - hat_c[best_i]) / N[best_i]
+        hat_l[best_i] += (l - hat_l[best_i]) / N[best_i]
+        sum_cost += c; sum_lat += l; sum_u += u; n += 1; t_step += 1
+        # Projected dual updates: penalise overspending per-step quota.
+        lam_b = max(0.0, lam_b + eta * (c - per_step_b) / max(per_step_b, 1e-6))
+        lam_d = max(0.0, lam_d + eta * (l - per_step_d) / max(per_step_d, 1e-6))
+    return RunResult("lagrangian", saturate_utility(sum_u), sum_cost,
+                     sum_lat, n, task.budget, task.deadline,
+                     sum_cost > task.budget, sum_lat > task.deadline)
+
+
+def run_policy_cvar_bwk(tools: List[Tool], task: Task,
+                        rng: np.random.Generator,
+                        delta: float = 0.1, prior_N: int = 3) -> RunResult:
+    """B2. CVaR-aware BwK.
+
+    Maintains per-arm empirical cost samples and uses the empirical
+    conditional-value-at-risk at level (1-delta) as the feasibility test,
+    rather than a sub-Gaussian tail.  This is more defensible under heavy
+    (Pareto) cost tails."""
+    K = len(tools)
+    samples_c: List[List[float]] = [[] for _ in range(K)]
+    samples_l: List[List[float]] = [[] for _ in range(K)]
+    hat_u = np.zeros(K); hat_c = np.array([t.mean_cost for t in tools])
+    hat_l = np.array([t.mean_latency for t in tools]); N = np.full(K, prior_N)
+    sum_cost = 0.0; sum_lat = 0.0; sum_u = 0.0; n = 0; t_step = 1
+
+    def cvar_estimate(samples: List[float], fallback: float) -> float:
+        if len(samples) < 3:
+            return fallback * 1.5  # mild inflation before enough data
+        s = sorted(samples)
+        k = max(1, int(math.ceil(delta * len(s))))
+        tail = s[-k:]
+        return float(np.mean(tail))
+
+    # Warm start.
+    for i in range(K):
+        if sum_cost + tools[i].mean_cost > task.budget or sum_lat + tools[i].mean_latency > task.deadline:
+            continue
+        c = tools[i].sample_cost(rng); l = tools[i].sample_latency(rng); u = tools[i].sample_observation_utility(rng)
+        samples_c[i].append(c); samples_l[i].append(l)
+        hat_u[i] = u; hat_c[i] = c; hat_l[i] = l; N[i] = 1
+        sum_cost += c; sum_lat += l; sum_u += u; n += 1; t_step += 1
+
+    while True:
+        best_i = -1; best_score = -np.inf
+        for i in range(K):
+            cvar_c = cvar_estimate(samples_c[i], hat_c[i])
+            cvar_l = cvar_estimate(samples_l[i], hat_l[i])
+            if sum_cost + cvar_c > task.budget or sum_lat + cvar_l > task.deadline:
+                continue
+            bonus = math.sqrt(2.0 * math.log(t_step + 1) / max(N[i], 1))
+            score = (hat_u[i] + bonus) / max(cvar_c, 0.5)
+            if score > best_score:
+                best_score = score; best_i = i
+        if best_i < 0 or best_score <= 0:
+            break
+        t = tools[best_i]
+        c = t.sample_cost(rng); l = t.sample_latency(rng); u = t.sample_observation_utility(rng)
+        N[best_i] += 1
+        samples_c[best_i].append(c); samples_l[best_i].append(l)
+        hat_u[best_i] += (u - hat_u[best_i]) / N[best_i]
+        hat_c[best_i] += (c - hat_c[best_i]) / N[best_i]
+        hat_l[best_i] += (l - hat_l[best_i]) / N[best_i]
+        sum_cost += c; sum_lat += l; sum_u += u; n += 1; t_step += 1
+    return RunResult("cvar_bwk", saturate_utility(sum_u), sum_cost,
+                     sum_lat, n, task.budget, task.deadline,
+                     sum_cost > task.budget, sum_lat > task.deadline)
+
+
+def run_policy_precheck_ucb(tools: List[Tool], task: Task,
+                            rng: np.random.Generator,
+                            prior_N: int = 3, kappa: float = 1.0) -> RunResult:
+    """B3. Deterministic pre-check UCB.
+
+    Engineer-style guarded greedy: for each candidate arm, compute an upper
+    confidence bound on realised cost (hat_c + kappa * conf).  Only fire the
+    call if sum_cost + UCB_cost(i) <= B and sum_lat + UCB_lat(i) <= D."""
+    K = len(tools)
+    hat_u = np.zeros(K); hat_c = np.array([t.mean_cost for t in tools])
+    hat_l = np.array([t.mean_latency for t in tools]); N = np.full(K, prior_N)
+    sum_cost = 0.0; sum_lat = 0.0; sum_u = 0.0; n = 0; t_step = 1
+    while True:
+        best_i = -1; best_score = -np.inf
+        for i in range(K):
+            conf = math.sqrt(2.0 * math.log(t_step + 1) / max(N[i], 1))
+            ucb_c = hat_c[i] + kappa * conf
+            ucb_l = hat_l[i] + kappa * conf
+            if sum_cost + ucb_c > task.budget or sum_lat + ucb_l > task.deadline:
+                continue
+            score = (hat_u[i] + conf) / max(hat_c[i], 0.5)
+            if score > best_score:
+                best_score = score; best_i = i
+        if best_i < 0 or best_score <= 0:
+            break
+        t = tools[best_i]
+        c = t.sample_cost(rng); l = t.sample_latency(rng); u = t.sample_observation_utility(rng)
+        N[best_i] += 1
+        hat_u[best_i] += (u - hat_u[best_i]) / N[best_i]
+        hat_c[best_i] += (c - hat_c[best_i]) / N[best_i]
+        hat_l[best_i] += (l - hat_l[best_i]) / N[best_i]
+        sum_cost += c; sum_lat += l; sum_u += u; n += 1; t_step += 1
+    return RunResult("precheck_ucb", saturate_utility(sum_u), sum_cost,
+                     sum_lat, n, task.budget, task.deadline,
+                     sum_cost > task.budget, sum_lat > task.deadline)
+
+
+def run_policy_cc_knapsack(tools: List[Tool], task: Task,
+                           rng: np.random.Generator,
+                           z_level: float = 1.2816) -> RunResult:
+    """B4. Non-adaptive chance-constrained knapsack.
+
+    Offline solve max sum v_i x_i s.t. sum (mu_i + z * sigma_i) x_i <= B with
+    x_i in {0,1}; execute selected set in fixed order.  This is the proper
+    non-adaptive oracle under chance constraints and the target of CBUC's
+    regret bound.  Uses *true* mu_i, sigma_i (clairvoyant on the distribution
+    family but not on realised draws), so we report it as an oracle."""
+    n = len(tools)
+    # Pareto(alpha) * mean_cost has sigma = mean_cost / sqrt((alpha-1)^2 (alpha-2))
+    # for alpha > 2; for alpha <= 2 variance is infinite so we cap with a
+    # conservative proxy (5 * mean).  z_level ~ 1.28 -> delta = 0.1.
+    sigmas = []
+    for t in tools:
+        a = t.cost_tail
+        if a > 2:
+            sigma = t.mean_cost / math.sqrt((a - 1) ** 2 * (a - 2))
+        else:
+            sigma = 5.0 * t.mean_cost
+        sigmas.append(sigma)
+    inflated = [t.mean_cost + z_level * sigmas[i] for i, t in enumerate(tools)]
+    # 0/1 knapsack on scaled integer weights.
+    scale = 10
+    W = max(1, int(task.budget * scale))
+    weights = [max(1, int(round(inflated[i] * scale))) for i in range(n)]
+    values = [t.marginal_utility for t in tools]
+    dp = [0.0] * (W + 1)
+    choice = [[False] * (W + 1) for _ in range(n)]
+    for i in range(n):
+        w = weights[i]; v = values[i]
+        if w > W:
+            continue
+        for cap in range(W, w - 1, -1):
+            nv = dp[cap - w] + v
+            if nv > dp[cap]:
+                dp[cap] = nv
+                choice[i][cap] = True
+    # Backtrack.
+    selected: List[int] = []
+    cap = W
+    for i in range(n - 1, -1, -1):
+        if choice[i][cap]:
+            selected.append(i); cap -= weights[i]
+    selected.reverse()
+    # Execute the selected set adaptively only in the sense of realised draws.
+    sum_cost = 0.0; sum_lat = 0.0; sum_u = 0.0; n_calls = 0
+    for i in selected:
+        t = tools[i]
+        c = t.sample_cost(rng); l = t.sample_latency(rng); u = t.sample_observation_utility(rng)
+        sum_cost += c; sum_lat += l; sum_u += u; n_calls += 1
+        if sum_cost > task.budget or sum_lat > task.deadline:
+            # Commit to the non-adaptive plan; do not halt mid-plan.
+            pass
+    return RunResult("cc_knapsack", saturate_utility(sum_u), sum_cost,
+                     sum_lat, n_calls, task.budget, task.deadline,
+                     sum_cost > task.budget, sum_lat > task.deadline)
+
+
 # ------------------------------ Sweep ---------------------------------------- #
 
 
 def run_cell(K: int, rho: float, cost_tail: float, utility_sparsity: float,
-             seed: int) -> List[dict]:
-    """One replicate across all policies."""
+             seed: int, include_stronger: bool = False) -> List[dict]:
+    """One replicate across all policies.
+
+    When include_stronger=True, additionally runs the four constraint-aware
+    baselines (Lagrangian, CVaR-BwK, pre-check UCB, CC-knapsack oracle)."""
     master = np.random.default_rng(seed)
     registry = make_registry(K, cost_tail, utility_sparsity, master)
     task = make_task(registry, rho, master)
@@ -336,6 +557,13 @@ def run_cell(K: int, rho: float, cost_tail: float, utility_sparsity: float,
         run_policy_cbuc(registry, task, sub(6), z_level=0.5, variant_name="cbuc_mod"),
         run_policy_cbuc(registry, task, sub(7), z_level=0.0, variant_name="cbuc_aggr"),
     ]
+    if include_stronger:
+        results.extend([
+            run_policy_lagrangian(registry.tools, task, sub(11)),
+            run_policy_cvar_bwk(registry.tools, task, sub(12)),
+            run_policy_precheck_ucb(registry.tools, task, sub(13)),
+            run_policy_cc_knapsack(registry.tools, task, sub(14)),
+        ])
     oracle_u = oracle_nonadaptive(registry.tools, task)
     rows = []
     for r in results:
@@ -354,12 +582,12 @@ def run_cell(K: int, rho: float, cost_tail: float, utility_sparsity: float,
     return rows
 
 
-def main(out_dir: str, n_seeds: int = 60):
+def main(out_dir: str, n_seeds: int = 60, include_stronger: bool = False,
+         out_name: str = "results.csv",
+         K_list=(10, 50, 200), rho_list=(0.2, 0.5, 1.0),
+         tail_list=(1.5, 2.5), sparsity_list=(0.2,)):
     os.makedirs(out_dir, exist_ok=True)
-    Ks = [10, 50, 200]
-    rhos = [0.2, 0.5, 1.0]
-    tails = [1.5, 2.5]
-    sparsities = [0.2]
+    Ks = list(K_list); rhos = list(rho_list); tails = list(tail_list); sparsities = list(sparsity_list)
     all_rows = []
     total = len(Ks) * len(rhos) * len(tails) * len(sparsities) * n_seeds
     done = 0
@@ -369,12 +597,13 @@ def main(out_dir: str, n_seeds: int = 60):
                 for sp in sparsities:
                     for s in range(n_seeds):
                         seed = hash((K, round(rho*100), round(tail*10), round(sp*100), s)) & 0xffff_ffff
-                        all_rows.extend(run_cell(K, rho, tail, sp, seed))
+                        all_rows.extend(run_cell(K, rho, tail, sp, seed,
+                                                 include_stronger=include_stronger))
                         done += 1
                         if done % 50 == 0:
                             print(f"  progress {done}/{total}")
     # Write CSV
-    csv_path = os.path.join(out_dir, "results.csv")
+    csv_path = os.path.join(out_dir, out_name)
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(all_rows[0].keys()))
         w.writeheader(); w.writerows(all_rows)
@@ -386,4 +615,6 @@ if __name__ == "__main__":
     import sys
     out = sys.argv[1] if len(sys.argv) > 1 else "./out"
     ns = int(sys.argv[2]) if len(sys.argv) > 2 else 30
-    main(out, n_seeds=ns)
+    stronger = (len(sys.argv) > 3 and sys.argv[3] == "stronger")
+    name = sys.argv[4] if len(sys.argv) > 4 else "results.csv"
+    main(out, n_seeds=ns, include_stronger=stronger, out_name=name)
